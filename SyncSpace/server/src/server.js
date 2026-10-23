@@ -10,6 +10,7 @@ const { Server } = require("socket.io");
 const prisma = require("./config/prisma");
 const authRoutes = require("./routes/authRoutes");
 const roomRoutes = require("./routes/roomRoutes");
+const socketAuthMiddleware = require("./middleware/socketAuthMiddleware");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,10 +18,8 @@ const server = http.createServer(app);
 const PORT = Number(process.env.PORT) || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
 
-// Security middleware.
 app.use(helmet());
 
-// CORS configuration.
 app.use(
   cors({
     origin: CLIENT_URL,
@@ -29,11 +28,9 @@ app.use(
   })
 );
 
-// Request parsing and logging.
 app.use(express.json({ limit: "100kb" }));
 app.use(morgan("dev"));
 
-// Socket.IO server.
 const io = new Server(server, {
   cors: {
     origin: CLIENT_URL,
@@ -43,7 +40,9 @@ const io = new Server(server, {
 
 app.set("io", io);
 
-// Root endpoint.
+// Authenticate every Socket.IO connection.
+io.use(socketAuthMiddleware);
+
 app.get("/", (req, res) => {
   res.status(200).json({
     message: "Welcome to SyncSpace API",
@@ -51,7 +50,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Health check.
 app.get("/api/health", (req, res) => {
   res.status(200).json({
     status: "healthy",
@@ -59,29 +57,205 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Authentication endpoints.
 app.use("/api/auth", authRoutes);
-
-// Room management endpoints.
 app.use("/api/rooms", roomRoutes);
 
-// Basic Socket.IO connection handling.
 io.on("connection", (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(
+    `Authenticated user connected: ${socket.user.name} (${socket.id})`
+  );
+
+  socket.emit("connection:success", {
+    message: "Authenticated connection established.",
+    user: socket.user,
+  });
+
+  // A client can join only a room where they are an owner or member.
+  socket.on("room:join", async (payload, callback) => {
+    const reply = typeof callback === "function" ? callback : () => {};
+
+    try {
+      const roomId =
+        payload && typeof payload.roomId === "string"
+          ? payload.roomId.trim()
+          : "";
+
+      if (!roomId) {
+        return reply({
+          success: false,
+          message: "A valid roomId is required.",
+        });
+      }
+
+      const room = await prisma.room.findFirst({
+        where: {
+          id: roomId,
+          OR: [
+            {
+              ownerId: socket.user.id,
+            },
+            {
+              members: {
+                some: {
+                  userId: socket.user.id,
+                },
+              },
+            },
+          ],
+        },
+        select: {
+          id: true,
+          name: true,
+          ownerId: true,
+          members: {
+            select: {
+              userId: true,
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!room) {
+        return reply({
+          success: false,
+          message: "Room not found or you are not a member.",
+        });
+      }
+
+      const socketRoom = `room:${room.id}`;
+
+      await socket.join(socketRoom);
+
+      const participants = await io
+        .in(socketRoom)
+        .fetchSockets();
+
+      const uniqueUsers = new Map();
+
+      for (const participant of participants) {
+        if (participant.user) {
+          uniqueUsers.set(participant.user.id, {
+            id: participant.user.id,
+            name: participant.user.name,
+          });
+        }
+      }
+
+      reply({
+        success: true,
+        message: "Joined room successfully.",
+        room: {
+          id: room.id,
+          name: room.name,
+        },
+        participants: Array.from(uniqueUsers.values()),
+      });
+
+      // Notify other room members that this user is online.
+      socket.to(socketRoom).emit("room:participant-joined", {
+        user: {
+          id: socket.user.id,
+          name: socket.user.name,
+        },
+        roomId: room.id,
+      });
+
+      console.log(
+        `${socket.user.name} joined Socket.IO room ${room.id}`
+      );
+    } catch (error) {
+      console.error("Socket room join error:", error.message);
+
+      reply({
+        success: false,
+        message: "Unable to join room.",
+      });
+    }
+  });
+
+  socket.on("room:leave", async (payload, callback) => {
+    const reply = typeof callback === "function" ? callback : () => {};
+
+    try {
+      const roomId =
+        payload && typeof payload.roomId === "string"
+          ? payload.roomId.trim()
+          : "";
+
+      if (!roomId) {
+        return reply({
+          success: false,
+          message: "A valid roomId is required.",
+        });
+      }
+
+      const socketRoom = `room:${roomId}`;
+
+      if (!socket.rooms.has(socketRoom)) {
+        return reply({
+          success: false,
+          message: "You have not joined this room.",
+        });
+      }
+
+      await socket.leave(socketRoom);
+
+      reply({
+        success: true,
+        message: "Left room successfully.",
+        roomId,
+      });
+
+      socket.to(socketRoom).emit("room:participant-left", {
+        user: {
+          id: socket.user.id,
+          name: socket.user.name,
+        },
+        roomId,
+      });
+    } catch (error) {
+      console.error("Socket room leave error:", error.message);
+
+      reply({
+        success: false,
+        message: "Unable to leave room.",
+      });
+    }
+  });
+
+  socket.on("disconnecting", () => {
+    for (const roomName of socket.rooms) {
+      if (roomName.startsWith("room:")) {
+        socket.to(roomName).emit("room:participant-left", {
+          user: {
+            id: socket.user.id,
+            name: socket.user.name,
+          },
+          roomId: roomName.slice("room:".length),
+        });
+      }
+    }
+  });
 
   socket.on("disconnect", (reason) => {
-    console.log(`User disconnected: ${socket.id} (${reason})`);
+    console.log(
+      `User disconnected: ${socket.user.name} (${socket.id}) - ${reason}`
+    );
   });
 });
 
-// Handle unknown endpoints.
 app.use((req, res) => {
   res.status(404).json({
     message: "Route not found.",
   });
 });
 
-// Central error handler.
 app.use((error, req, res, next) => {
   if (res.headersSent) {
     return next(error);
@@ -104,7 +278,6 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Start the application after connecting to PostgreSQL.
 async function startServer() {
   try {
     if (!process.env.JWT_SECRET) {
@@ -126,7 +299,6 @@ async function startServer() {
   }
 }
 
-// Gracefully shut down the server.
 let isShuttingDown = false;
 
 async function shutdown(signal) {
